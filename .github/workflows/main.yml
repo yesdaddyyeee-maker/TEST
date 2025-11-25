@@ -1,0 +1,117 @@
+
+name: WhatsApp Bot Deployment
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: whatsapp_bot
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install Node dependencies
+      run: npm ci
+
+    - name: Install Python dependencies
+      run: |
+        pip install --upgrade pip
+        pip install beautifulsoup4 cloudscraper fastapi lxml psycopg2-binary trafilatura uvicorn
+
+    - name: Setup Database Schema
+      env:
+        PGPASSWORD: postgres
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/whatsapp_bot
+      run: |
+        psql -h localhost -U postgres -d whatsapp_bot -f database/schema.sql
+        echo "✅ Database schema created successfully"
+
+    - name: Setup environment variables
+      run: |
+        echo "PHONE_NUMBER=${{ secrets.PHONE_NUMBER }}" >> $GITHUB_ENV
+        echo "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/whatsapp_bot" >> $GITHUB_ENV
+        echo "API_URL=http://0.0.0.0:8000" >> $GITHUB_ENV
+
+    - name: Start FastAPI Server
+      run: |
+        python3 api_server.py &
+        API_PID=$!
+        echo "API_PID=$API_PID" >> $GITHUB_ENV
+        sleep 10
+        curl -f http://0.0.0.0:8000 || exit 1
+        echo "✅ FastAPI server started (PID: $API_PID)"
+
+    - name: Start WhatsApp Bot
+      run: |
+        node bot.js &
+        BOT_PID=$!
+        echo "BOT_PID=$BOT_PID" >> $GITHUB_ENV
+        sleep 15
+        echo "✅ WhatsApp bot started (PID: $BOT_PID)"
+        
+    - name: Health Check
+      run: |
+        echo "🔍 Checking services health..."
+        ps -p $API_PID > /dev/null && echo "✅ API Server is running" || echo "❌ API Server stopped"
+        ps -p $BOT_PID > /dev/null && echo "✅ WhatsApp Bot is running" || echo "❌ WhatsApp Bot stopped"
+
+    - name: Monitor Services
+      timeout-minutes: 360
+      run: |
+        while true; do
+          echo "🤖 Services Status - $(date '+%Y-%m-%d %H:%M:%S')"
+          
+          if ! ps -p $API_PID > /dev/null; then
+            echo "❌ API Server stopped unexpectedly"
+            exit 1
+          fi
+          
+          if ! ps -p $BOT_PID > /dev/null; then
+            echo "❌ WhatsApp Bot stopped unexpectedly"
+            exit 1
+          fi
+          
+          echo "✅ All services running normally"
+          sleep 60
+        done
+
+    - name: Cleanup on failure
+      if: failure()
+      run: |
+        echo "🧹 Cleaning up processes..."
+        kill $API_PID 2>/dev/null || true
+        kill $BOT_PID 2>/dev/null || true
+        echo "✅ Cleanup completed"
